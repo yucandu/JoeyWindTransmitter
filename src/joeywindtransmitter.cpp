@@ -1,0 +1,496 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include "driver/pulse_cnt.h"
+#include <FastLED.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include <ADS1115_WE.h>
+#include <ArduinoOTA.h>
+#include <SimplePgSQL.h>
+#include "esp_sntp.h"
+#include "time.h"
+// ==================== CONFIGURATION ====================
+#define DEVICE_ID 1010
+
+// WiFi credentials
+const char* ssid     = "mikesnet";
+const char* password = "springchicken";
+
+// Blynk — neoAuth, local server
+char auth[] = "19oL8t8mImCdoUqYhfhk6DADL7540f8s";
+char authHubert[] = "8_-CN2rm4ki9P3i_NkPhxIbCiKd5RXhK";  //hubert
+// Blynk virtual pins (matching relay's bridgeNeo / direct writes)
+#define VPIN_AVG_WIND   V31
+#define VPIN_WIND_GUST  V32
+#define VPIN_WIND_ANGLE V33
+
+// ==================== POSTGRESQL ====================
+WiFiClient pgClient;
+char pgBuffer[512];
+PGconnection pgConn(&pgClient, 0, 512, pgBuffer);
+int pg_status = 0;
+IPAddress PGIP(192, 168, 50, 197);
+const char pg_user[]   = "wanburst";
+const char pg_pass[]   = "elec&9";
+const char pg_db[]     = "blynk_reporting";
+
+// ==================== HARDWARE ====================
+#define ADS1115_I2C_ADDR 0x48
+ADS1115_WE ads(ADS1115_I2C_ADDR);
+
+#define NUM_LEDS  1
+#define PIN_DATA  21
+CRGB leds[NUM_LEDS];
+WidgetBridge bridgeHubert(V60);
+const int ANEMOMETER_PIN = 11;
+const int BUTTON_PIN     = 1;
+const int LED_PIN        = 17;
+
+// ==================== WIND VANE CALIBRATION ====================
+enum SFEWeatherMeterKitAnemometerAngles {
+    WMK_ANGLE_0_0 = 0,
+    WMK_ANGLE_22_5,
+    WMK_ANGLE_45_0,
+    WMK_ANGLE_67_5,
+    WMK_ANGLE_90_0,
+    WMK_ANGLE_112_5,
+    WMK_ANGLE_135_0,
+    WMK_ANGLE_157_5,
+    WMK_ANGLE_180_0,
+    WMK_ANGLE_202_5,
+    WMK_ANGLE_225_0,
+    WMK_ANGLE_247_5,
+    WMK_ANGLE_270_0,
+    WMK_ANGLE_292_5,
+    WMK_ANGLE_315_0,
+    WMK_ANGLE_337_5,
+    WMK_NUM_ANGLES
+};
+
+#define SFE_WIND_VANE_DEGREES_PER_INDEX  (360.0f / 16.0f)
+#define SFE_WMK_ADC_ANGLE_0_0    20264
+#define SFE_WMK_ADC_ANGLE_22_5   10539
+#define SFE_WMK_ADC_ANGLE_45_0   11966
+#define SFE_WMK_ADC_ANGLE_67_5    2188
+#define SFE_WMK_ADC_ANGLE_90_0    2428
+#define SFE_WMK_ADC_ANGLE_112_5   1721
+#define SFE_WMK_ADC_ANGLE_135_0   4797
+#define SFE_WMK_ADC_ANGLE_157_5   3287
+#define SFE_WMK_ADC_ANGLE_180_0   7466
+#define SFE_WMK_ADC_ANGLE_202_5   6363
+#define SFE_WMK_ADC_ANGLE_225_0  16314
+#define SFE_WMK_ADC_ANGLE_247_5  15526
+#define SFE_WMK_ADC_ANGLE_270_0  24322
+#define SFE_WMK_ADC_ANGLE_292_5  21326
+#define SFE_WMK_ADC_ANGLE_315_0  22844
+#define SFE_WMK_ADC_ANGLE_337_5  18149
+
+struct SFEWeatherMeterKitCalibrationParams {
+    uint16_t vaneADCValues[WMK_NUM_ANGLES];
+};
+SFEWeatherMeterKitCalibrationParams _calibrationParams;
+
+// ==================== ANEMOMETER / WIND STATE ====================
+const float CALIBRATION_FACTOR  = 2.4;
+const int   GLITCH_FILTER_NS    = 4000;
+
+const int AVG_WINDOW_SIZE  = 60;   // 60 x 1-second samples → 60 s average
+// GUST_WINDOW_SIZE removed: gust is now peak over the full avg window,
+// reset each 60-second reporting cycle.
+
+float avgSamples[AVG_WINDOW_SIZE];
+int   avgIndex  = 0;
+int   avgCount  = 0;
+
+float currentWindSpeed = 0.0;
+float averageWindSpeed = 0.0;
+float windGust         = 0.0;
+float windAngle        = 0.0;
+int16_t   windVaneReading  = 0;
+
+// Direction sample buffer for mode-based 60-second direction reporting
+// Sampled every 3 s → up to 20 samples per minute
+#define DIR_SAMPLE_MAX 20
+float dirSamples[DIR_SAMPLE_MAX];
+int   dirSampleCount = 0;
+
+pcnt_unit_handle_t pcnt_unit = NULL;
+
+// ==================== LED / PULSE BLINK ====================
+volatile uint32_t ledOnTime = 0;   // millis() timestamp set by ISR, 0 = off
+
+// ==================== TIMING ====================
+#define every(interval) \
+    static uint32_t __every__##interval = millis(); \
+    if (millis() - __every__##interval >= interval && (__every__##interval = millis()))
+
+unsigned long reconnectTime = 0;
+bool isNtpSynced = false;
+
+// ==================== FUNCTION PROTOTYPES ====================
+void    initCalibrationParams();
+float   getWindDirection(int16_t adcValue);
+void    initPulseCounter();
+void    updateWindData();
+float   getInstantWindSpeed();
+int16_t readWindVaneADC();
+void IRAM_ATTR handlePulseInterrupt();
+void IRAM_ATTR handleChangeInterrupt();
+
+// ==================== WIND VANE ====================
+void initCalibrationParams() {
+    _calibrationParams.vaneADCValues[WMK_ANGLE_0_0]   = SFE_WMK_ADC_ANGLE_0_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_22_5]  = SFE_WMK_ADC_ANGLE_22_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_45_0]  = SFE_WMK_ADC_ANGLE_45_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_67_5]  = SFE_WMK_ADC_ANGLE_67_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_90_0]  = SFE_WMK_ADC_ANGLE_90_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_112_5] = SFE_WMK_ADC_ANGLE_112_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_135_0] = SFE_WMK_ADC_ANGLE_135_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_157_5] = SFE_WMK_ADC_ANGLE_157_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_180_0] = SFE_WMK_ADC_ANGLE_180_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_202_5] = SFE_WMK_ADC_ANGLE_202_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_225_0] = SFE_WMK_ADC_ANGLE_225_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_247_5] = SFE_WMK_ADC_ANGLE_247_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_270_0] = SFE_WMK_ADC_ANGLE_270_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_292_5] = SFE_WMK_ADC_ANGLE_292_5;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_315_0] = SFE_WMK_ADC_ANGLE_315_0;
+    _calibrationParams.vaneADCValues[WMK_ANGLE_337_5] = SFE_WMK_ADC_ANGLE_337_5;
+}
+
+float getWindDirection(int16_t adcValue) {
+    int32_t closestDifference = INT32_MAX;
+    uint8_t closestIndex = 0;
+    for (uint8_t i = 0; i < WMK_NUM_ANGLES; i++) {
+        int32_t diff = abs((int32_t)_calibrationParams.vaneADCValues[i] - (int32_t)adcValue);
+        if (diff < closestDifference) {
+            closestDifference = diff;
+            closestIndex = i;
+        }
+    }
+    return (float)closestIndex * SFE_WIND_VANE_DEGREES_PER_INDEX;
+}
+
+// ==================== ADS1115 ====================
+int16_t readWindVaneADC() {
+    // Continuous mode — just return the most recent conversion, no waiting
+    return ads.getRawResult();
+}
+
+// ==================== PULSE COUNTER ====================
+void initPulseCounter() {
+    pcnt_unit_config_t unit_config = {
+        .low_limit  = -32768,
+        .high_limit =  32767,
+    };
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_unit));
+
+    pcnt_glitch_filter_config_t filter_config = {
+        .max_glitch_ns = GLITCH_FILTER_NS,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filter_config));
+
+    pcnt_chan_config_t chan_config = {
+        .edge_gpio_num  = ANEMOMETER_PIN,
+        .level_gpio_num = -1,
+    };
+    pcnt_channel_handle_t pcnt_chan = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_config, &pcnt_chan));
+
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan,
+        PCNT_CHANNEL_EDGE_ACTION_HOLD,      // rising  → ignore
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE   // falling → count
+    ));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP));
+
+    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
+}
+
+float getInstantWindSpeed() {
+    int pulse_count = 0;
+    ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    return (float)pulse_count * CALIBRATION_FACTOR;
+}
+
+void updateWindData() {
+    currentWindSpeed = getInstantWindSpeed();
+
+    // --- 60-second rolling average ---
+    avgSamples[avgIndex] = currentWindSpeed;
+    avgIndex = (avgIndex + 1) % AVG_WINDOW_SIZE;
+    if (avgCount < AVG_WINDOW_SIZE) avgCount++;
+
+    float sum = 0.0;
+    for (int i = 0; i < avgCount; i++) sum += avgSamples[i];
+    averageWindSpeed = sum / avgCount;
+
+    // --- FIX: Gust = peak reading across the full avg window ---
+    // Previously used a separate 3-sample window, which could report a gust
+    // lower than the average once the 3-second peak rotated out.
+    // Now gust tracks the max of all samples in the same 60-second window.
+    windGust = 0.0;
+    for (int i = 0; i < avgCount; i++) {
+        if (avgSamples[i] > windGust) windGust = avgSamples[i];
+    }
+}
+
+// ==================== POSTGRESQL WIND DIRECTION ====================
+void doPgPump() {
+    if (!pg_status) {
+        pgConn.setDbLogin(PGIP, pg_user, pg_pass, pg_db, "utf8");
+        pg_status = 1;
+        return;
+    }
+    if (pg_status == 1) {
+        int rc = pgConn.status();
+        if (rc == CONNECTION_BAD || rc == CONNECTION_NEEDED) {
+            pgConn.getMessage();
+            pg_status = -1;
+        } else if (rc == CONNECTION_OK) {
+            pg_status = 2;
+        }
+        return;
+    }
+    if (pg_status == 2) return;  // idle — caller drives queries
+    if (pg_status == 3) {
+        int rc = pgConn.getData();
+        if (rc < 0) { pg_status = -1; return; }
+        if (rc & PG_RSTAT_READY) pg_status = 2;
+    }
+}
+
+void sendWindDirectionToPg(float angle) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    // (Re)connect if needed
+    if (pg_status == -1) pg_status = 0;
+
+    unsigned long deadline = millis() + 5000;
+    while (pg_status < 2 && millis() < deadline) {
+        doPgPump();
+        delay(10);
+    }
+    if (pg_status != 2) {
+        Serial.println("PG: could not connect, skipping direction write.");
+        return;
+    }
+
+    time_t now = time(nullptr);
+    uint32_t epoch = (uint32_t)now;
+    String q = "insert into burst values "
+               "(38,1," + String(epoch) + "," + String(angle, 2) + "), "
+               "(38,2," + String(epoch) + "," + String(averageWindSpeed, 2) + "), "
+               "(38,3," + String(epoch) + "," + String(windGust, 2) + ")";
+    pgConn.execute(q.c_str());
+    pg_status = 3;
+
+    deadline = millis() + 3000;
+    while (pg_status == 3 && millis() < deadline) {
+        doPgPump();
+        delay(10);
+    }
+}
+
+BLYNK_CONNECTED() {
+  bridgeHubert.setAuthToken (authHubert);
+}
+// ==================== SETUP ====================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    // ── 1. FastLED FIRST ── WS2812B disables interrupts during write;
+    //    must run before WiFi/Blynk init to avoid IPC1 stack corruption.
+    FastLED.addLeds<WS2812B, PIN_DATA, GRB>(leds, NUM_LEDS);
+    FastLED.setBrightness(10);
+    FastLED.clear();
+    FastLED.show();
+    leds[0] = CRGB::White; FastLED.show(); delay(500);
+    leds[0] = CRGB::Black; FastLED.show(); delay(500);
+    leds[0] = CRGB::White; FastLED.show(); delay(500);
+    leds[0] = CRGB::Black; FastLED.show();
+
+    Serial.println("ESP32-S3 Wind Transmitter (WiFi + Blynk)");
+
+    // ── 2. Wind vane calibration params ──
+    initCalibrationParams();
+
+    // ── 3. I2C + ADS1115 ──
+    Wire.begin(5, 6);
+    ads.init();
+    ads.setVoltageRange_mV(ADS1115_RANGE_4096);
+    ads.setCompareChannels(ADS1115_COMP_0_GND);
+    ads.setConvRate(ADS1115_8_SPS);
+    
+    ads.setMeasureMode(ADS1115_CONTINUOUS);  // free-running; getRawResult() always has fresh data
+    //ads.startSingleMeasurement();            // kick off continuous conversions
+
+    // ── 4. Hardware pulse counter ──
+    Serial.println("Initializing pulse counter...");
+    initPulseCounter();
+    Serial.println("Pulse counter initialized!");
+
+    // ── 5. WiFi ──
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(300);
+    }
+    Serial.println();
+    Serial.print("Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+
+    // ── 6. Blynk (local server) ──
+    Blynk.config(auth, IPAddress(192, 168, 50, 197), 8080);
+    Blynk.connect();
+    Serial.print("Connecting to Blynk");
+    unsigned long blynkStart = millis();
+    while (!Blynk.connected() && millis() - blynkStart < 10000) {
+        Serial.print(".");
+        delay(500);
+    }
+    if (Blynk.connected()) {
+        Serial.println("\nBlynk connected!");
+    } else {
+        Serial.println("\nBlynk timeout — will retry in loop.");
+    }
+
+    // ── 7. NTP ──
+    sntp_set_time_sync_notification_cb([](struct timeval*) {
+        isNtpSynced = true;
+        Serial.println("NTP synced.");
+    });
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "192.168.50.197");
+    esp_sntp_init();
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);
+    tzset();
+
+    // ── 8. Attach anemometer interrupt LAST ──
+    attachInterrupt(digitalPinToInterrupt(ANEMOMETER_PIN), handleChangeInterrupt, CHANGE);
+    Serial.println("Setup complete. Transmitting wind data.");
+    ArduinoOTA.setHostname("JoeyWindTransmitter");
+    ArduinoOTA.begin();
+}
+
+// ==================== INTERRUPTS ====================
+void IRAM_ATTR handlePulseInterrupt() {
+    // kept for pulse-counter compatibility (not attached, logic preserved)
+    static uint32_t lastTrigger = 0;
+    uint32_t now = millis();
+    if (now - lastTrigger > 20) {
+        lastTrigger = now;
+    }
+}
+
+void IRAM_ATTR handleChangeInterrupt() {
+    if (digitalRead(ANEMOMETER_PIN) == LOW) {
+        digitalWrite(LED_PIN, HIGH);  // falling edge → LED ON
+        ledOnTime = millis();
+    } else { 
+        digitalWrite(LED_PIN, LOW);   // rising edge → LED OFF immediately
+        ledOnTime = 0;
+    }
+}
+
+// ==================== LOOP ====================
+void loop() {
+    // Turn LED off after 2 ms, or immediately if the switch has already opened
+    if (ledOnTime && (millis() - ledOnTime >= 2)) {
+        digitalWrite(LED_PIN, LOW);
+        ledOnTime = 0;
+    }
+
+    // WiFi watchdog — reconnect if dropped
+    if (WiFi.status() != WL_CONNECTED) {
+        if (millis() - reconnectTime > 30000) {
+            Serial.println("WiFi lost — reconnecting...");
+            WiFi.disconnect();
+            WiFi.reconnect();
+            unsigned long t = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
+                delay(300);
+            }
+            reconnectTime = millis();
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Blynk.run();
+        ArduinoOTA.handle();
+    }
+
+    // Sample wind speed every second
+    every(1000) {
+        updateWindData();
+    }
+
+    // Sample wind vane every 3 seconds and push to Hubert bridge
+    every(3000) {
+        windVaneReading = readWindVaneADC();
+        float angle = getWindDirection(windVaneReading);
+        // FIX: added braces — previously only the dirSamples assignment was
+        // guarded by the if; the three virtualWrite calls always executed.
+        if (dirSampleCount < DIR_SAMPLE_MAX) {
+            dirSamples[dirSampleCount++] = angle;
+        }
+        bridgeHubert.virtualWrite(V84, averageWindSpeed);
+        bridgeHubert.virtualWrite(V85, windGust);
+        bridgeHubert.virtualWrite(V86, angle);
+    }
+
+    // Push to Blynk every 60 seconds using mode direction from accumulated samples
+    every(60000) {
+        // Compute mode direction from accumulated samples.
+        // The vane snaps to one of 16 fixed angles, so we count occurrences
+        // of each and pick the most frequent.
+        if (dirSampleCount > 0) {
+            int votes[WMK_NUM_ANGLES] = {};
+            for (int i = 0; i < dirSampleCount; i++) {
+                int idx = (int)roundf(dirSamples[i] / SFE_WIND_VANE_DEGREES_PER_INDEX)
+                          % WMK_NUM_ANGLES;
+                votes[idx]++;
+            }
+            int bestIdx = 0;
+            for (int i = 1; i < WMK_NUM_ANGLES; i++) {
+                if (votes[i] > votes[bestIdx]) bestIdx = i;
+            }
+            windAngle = bestIdx * SFE_WIND_VANE_DEGREES_PER_INDEX;
+        }
+        // Reset direction sample buffer for next minute
+        dirSampleCount = 0;
+
+
+
+        if (Blynk.connected()) {
+            Blynk.virtualWrite(VPIN_AVG_WIND,  averageWindSpeed);
+            Blynk.virtualWrite(VPIN_WIND_GUST, windGust);
+            Blynk.virtualWrite(VPIN_WIND_ANGLE, windAngle);
+        }
+        // Wind direction goes directly to PostgreSQL (sensorid=38, value1=angle)
+        // to avoid Blynk's improper circular averaging (e.g. 0° and 359° → 180°).
+        // Only send once we have a valid NTP-synced epoch time.
+        if (isNtpSynced) {
+            sendWindDirectionToPg(windAngle);
+        }
+        // FIX: Reset gust so it reflects the peak of the *next* 60-second
+        // window rather than accumulating indefinitely.
+        windGust = 0.0;
+        avgCount = 0;
+        avgIndex = 0;
+    }
+}
