@@ -1,13 +1,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
+#include <AsyncMqttClient.h>
 #include "driver/pulse_cnt.h"
 #include <FastLED.h>
 #include <esp_wifi.h>
 #include <Wire.h>
 #include <ADS1115_WE.h>
 #include <ArduinoOTA.h>
-#include <SimplePgSQL.h>
 #include "esp_sntp.h"
 #include "time.h"
 // ==================== CONFIGURATION ====================
@@ -24,16 +24,36 @@ char authHubert[] = "8_-CN2rm4ki9P3i_NkPhxIbCiKd5RXhK";  //hubert
 #define VPIN_AVG_WIND   V31
 #define VPIN_WIND_GUST  V32
 #define VPIN_WIND_ANGLE V33
+#define VPIN_WIND_ANGLE_HOURLY V34
 
-// ==================== POSTGRESQL ====================
-WiFiClient pgClient;
-char pgBuffer[512];
-PGconnection pgConn(&pgClient, 0, 512, pgBuffer);
-int pg_status = 0;
-IPAddress PGIP(192, 168, 50, 197);
-const char pg_user[]   = "wanburst";
-const char pg_pass[]   = "elec&9";
-const char pg_db[]     = "blynk_reporting";
+// ==================== MQTT ====================
+// Same IP as Blynk server
+#define MQTT_HOST    IPAddress(192, 168, 50, 197)
+#define MQTT_PORT    1883
+const char* mqttUser     = "moeburn";
+const char* mqttPassword = "minimi";
+const char* mqttClientId = "joey_wind";
+
+AsyncMqttClient mqttClient;
+TimerHandle_t   mqttReconnectTimer;
+
+void connectToMqtt() {
+    Serial.println("Connecting to MQTT...");
+    mqttClient.connect();
+}
+
+void onMqttConnect(bool sessionPresent) {
+    Serial.println("MQTT connected.");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+    Serial.println("MQTT disconnected.");
+    // Always start the reconnect timer — even if WiFi is currently down.
+    // If WiFi is still down when the timer fires, connectToMqtt() will fail
+    // gracefully and onMqttDisconnect will re-arm the timer for another retry.
+    // This ensures MQTT recovers after a WiFi dropout without any extra logic.
+    xTimerStart(mqttReconnectTimer, 0);
+}
 
 // ==================== HARDWARE ====================
 #define ADS1115_I2C_ADDR 0x48
@@ -95,11 +115,11 @@ SFEWeatherMeterKitCalibrationParams _calibrationParams;
 const float CALIBRATION_FACTOR  = 2.4;
 const int   GLITCH_FILTER_NS    = 4000;
 
-const int AVG_WINDOW_SIZE  = 60;   // 60 x 1-second samples → 60 s average
-// GUST_WINDOW_SIZE removed: gust is now peak over the full avg window,
-// reset each 60-second reporting cycle.
+const int AVG_WINDOW_MAX   = 600;   // 10-minute ceiling at 1 sample/sec
+int       avgWindowSize    = 600;    // runtime-adjustable, default 60 s
+int       gustWindowSize   = 3;     // runtime-adjustable, default 3 s
 
-float avgSamples[AVG_WINDOW_SIZE];
+float avgSamples[AVG_WINDOW_MAX];
 int   avgIndex  = 0;
 int   avgCount  = 0;
 
@@ -109,11 +129,17 @@ float windGust         = 0.0;
 float windAngle        = 0.0;
 int16_t   windVaneReading  = 0;
 
-// Direction sample buffer for mode-based 60-second direction reporting
-// Sampled every 3 s → up to 20 samples per minute
+// Direction sample buffer — one sample every 3 s → 20 samples per minute.
+// Direction reporting always uses the last 60 s regardless of avg window size.
 #define DIR_SAMPLE_MAX 20
 float dirSamples[DIR_SAMPLE_MAX];
 int   dirSampleCount = 0;
+
+// Hourly direction tracking — stores the 60 minutely mode values
+#define HOURLY_DIR_SAMPLE_MAX 60
+float hourlyDirSamples[HOURLY_DIR_SAMPLE_MAX];
+int   hourlyDirSampleCount = 0;
+float hourlyWindAngle = 0.0;
 
 pcnt_unit_handle_t pcnt_unit = NULL;
 
@@ -137,7 +163,64 @@ float   getInstantWindSpeed();
 int16_t readWindVaneADC();
 void IRAM_ATTR handlePulseInterrupt();
 void IRAM_ATTR handleChangeInterrupt();
+WidgetTerminal terminal(V10);
+void printLocalTime();
+BLYNK_WRITE(V10) {
+  String cmd = param.asStr();
+  if (cmd == "help") {
+    terminal.println("==List of available commands:==");
+    terminal.println("wifi");
+    terminal.println("a<seconds>  — set avg window (1-600), e.g. a180");
+    terminal.println("g<seconds>  — set gust window (1-avg), e.g. g6");
+    terminal.println("==End of list.==");
+  }
+  else if (cmd == "wifi") {
+    terminal.print("Connected to: ");
+    terminal.println(ssid);
+    terminal.print("IP address:");
+    terminal.println(WiFi.localIP());
+    terminal.print("Signal strength: ");
+    terminal.println(WiFi.RSSI());
+    printLocalTime();
+  }
+  else if (cmd.length() >= 2 && cmd[0] == 'a') {
+    int val = cmd.substring(1).toInt();
+    if (val >= 1 && val <= AVG_WINDOW_MAX) {
+      avgWindowSize = val;
+      // Reset buffer so stale samples from a different window don't pollute avg
+      avgCount = 0;
+      avgIndex = 0;
+      // Clamp gust window in case it's now larger than the new avg window
+      if (gustWindowSize > avgWindowSize) gustWindowSize = avgWindowSize;
+      terminal.print("Avg window set to ");
+      terminal.print(avgWindowSize);
+      terminal.println(" s");
+    } else {
+      terminal.println("Invalid: avg window must be 1-600");
+    }
+  }
+  else if (cmd.length() >= 2 && cmd[0] == 'g') {
+    int val = cmd.substring(1).toInt();
+    if (val >= 1 && val <= avgWindowSize) {
+      gustWindowSize = val;
+      terminal.print("Gust window set to ");
+      terminal.print(gustWindowSize);
+      terminal.println(" s");
+    } else {
+      terminal.print("Invalid: gust window must be 1-");
+      terminal.println(avgWindowSize);
+    }
+  }
+  terminal.flush();
+}
 
+void printLocalTime() {
+  time_t rawtime;
+  struct tm* timeinfo;
+  time(&rawtime);
+  timeinfo = localtime(&rawtime);
+  terminal.print(asctime(timeinfo));
+}
 // ==================== WIND VANE ====================
 void initCalibrationParams() {
     _calibrationParams.vaneADCValues[WMK_ANGLE_0_0]   = SFE_WMK_ADC_ANGLE_0_0;
@@ -211,88 +294,58 @@ void initPulseCounter() {
 }
 
 float getInstantWindSpeed() {
+    static uint32_t lastReadMs = 0;
+    uint32_t now = millis();
+    uint32_t elapsedMs = (lastReadMs == 0) ? 1000 : (now - lastReadMs);
+    if (elapsedMs == 0) elapsedMs = 1;  // guard against zero division
+    lastReadMs = now;
+
     int pulse_count = 0;
     ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
     ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
-    return (float)pulse_count * CALIBRATION_FACTOR;
+
+    // Normalise to a 1-second rate so WiFi stalls don't inflate readings
+    float elapsed_s = elapsedMs / 1000.0f;
+    return ((float)pulse_count / elapsed_s) * CALIBRATION_FACTOR;
 }
+
+// Physical upper limit of the anemometer (~80 m/s → ~288 kph).
+// Any sample above this is a measurement artefact (stall, glitch, etc.)
+// and is clamped rather than rejected so the buffer always advances.
+#define MAX_PLAUSIBLE_KPH  200.0f
 
 void updateWindData() {
     currentWindSpeed = getInstantWindSpeed();
+    if (currentWindSpeed > MAX_PLAUSIBLE_KPH) currentWindSpeed = MAX_PLAUSIBLE_KPH;
 
-    // --- 60-second rolling average ---
+    // --- rolling average (respects avgWindowSize) ---
     avgSamples[avgIndex] = currentWindSpeed;
-    avgIndex = (avgIndex + 1) % AVG_WINDOW_SIZE;
-    if (avgCount < AVG_WINDOW_SIZE) avgCount++;
+    avgIndex = (avgIndex + 1) % avgWindowSize;
+    if (avgCount < avgWindowSize) avgCount++;
 
     float sum = 0.0;
     for (int i = 0; i < avgCount; i++) sum += avgSamples[i];
     averageWindSpeed = sum / avgCount;
 
-    // --- FIX: Gust = peak reading across the full avg window ---
-    // Previously used a separate 3-sample window, which could report a gust
-    // lower than the average once the 3-second peak rotated out.
-    // Now gust tracks the max of all samples in the same 60-second window.
+    // --- Gust = highest average over any gustWindowSize-wide sub-window
+    //     within the full avgWindowSize history ---
     windGust = 0.0;
-    for (int i = 0; i < avgCount; i++) {
-        if (avgSamples[i] > windGust) windGust = avgSamples[i];
-    }
-}
-
-// ==================== POSTGRESQL WIND DIRECTION ====================
-void doPgPump() {
-    if (!pg_status) {
-        pgConn.setDbLogin(PGIP, pg_user, pg_pass, pg_db, "utf8");
-        pg_status = 1;
-        return;
-    }
-    if (pg_status == 1) {
-        int rc = pgConn.status();
-        if (rc == CONNECTION_BAD || rc == CONNECTION_NEEDED) {
-            pgConn.getMessage();
-            pg_status = -1;
-        } else if (rc == CONNECTION_OK) {
-            pg_status = 2;
+    if (avgCount >= gustWindowSize) {
+        for (int start = 0; start <= avgCount - gustWindowSize; start++) {
+            float sum = 0.0;
+            for (int j = 0; j < gustWindowSize; j++) {
+                // Walk the ring buffer from oldest-available sample forward
+                int idx = (avgIndex - avgCount + start + j + avgWindowSize) % avgWindowSize;
+                sum += avgSamples[idx];
+            }
+            float windowAvg = sum / gustWindowSize;
+            if (windowAvg > windGust) windGust = windowAvg;
         }
-        return;
-    }
-    if (pg_status == 2) return;  // idle — caller drives queries
-    if (pg_status == 3) {
-        int rc = pgConn.getData();
-        if (rc < 0) { pg_status = -1; return; }
-        if (rc & PG_RSTAT_READY) pg_status = 2;
-    }
-}
-
-void sendWindDirectionToPg(float angle) {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    // (Re)connect if needed
-    if (pg_status == -1) pg_status = 0;
-
-    unsigned long deadline = millis() + 5000;
-    while (pg_status < 2 && millis() < deadline) {
-        doPgPump();
-        delay(10);
-    }
-    if (pg_status != 2) {
-        Serial.println("PG: could not connect, skipping direction write.");
-        return;
-    }
-
-    time_t now = time(nullptr);
-    uint32_t epoch = (uint32_t)now;
-    String q = "insert into burst values "
-               "(38,1," + String(epoch) + "," + String(angle, 2) + "), "
-               "(38,2," + String(epoch) + "," + String(averageWindSpeed, 2) + "), "
-               "(38,3," + String(epoch) + "," + String(windGust, 2) + ")";
-    pgConn.execute(q.c_str());
-    pg_status = 3;
-
-    deadline = millis() + 3000;
-    while (pg_status == 3 && millis() < deadline) {
-        doPgPump();
-        delay(10);
+    } else {
+        // Not enough samples yet — gust is just the current peak
+        for (int i = 0; i < avgCount; i++) {
+            if (avgSamples[i] > windGust) windGust = avgSamples[i];
+        }
     }
 }
 
@@ -319,7 +372,7 @@ void setup() {
     leds[0] = CRGB::White; FastLED.show(); delay(500);
     leds[0] = CRGB::Black; FastLED.show();
 
-    Serial.println("ESP32-S3 Wind Transmitter (WiFi + Blynk)");
+    Serial.println("ESP32-S3 Wind Transmitter (WiFi + Blynk + MQTT)");
 
     // ── 2. Wind vane calibration params ──
     initCalibrationParams();
@@ -369,7 +422,18 @@ void setup() {
         Serial.println("\nBlynk timeout — will retry in loop.");
     }
 
-    // ── 7. NTP ──
+    // ── 7. MQTT ──
+    mqttReconnectTimer = xTimerCreate("mqttReconnect", pdMS_TO_TICKS(5000),
+                                      pdFALSE, NULL,
+                                      [](TimerHandle_t){ connectToMqtt(); });
+    mqttClient.onConnect(onMqttConnect);
+    mqttClient.onDisconnect(onMqttDisconnect);
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCredentials(mqttUser, mqttPassword);
+    mqttClient.setClientId(mqttClientId);
+    connectToMqtt();
+
+    // ── 8. NTP ──
     sntp_set_time_sync_notification_cb([](struct timeval*) {
         isNtpSynced = true;
         Serial.println("NTP synced.");
@@ -380,11 +444,22 @@ void setup() {
     setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);
     tzset();
 
-    // ── 8. Attach anemometer interrupt LAST ──
+    // ── 9. Attach anemometer interrupt LAST ──
     attachInterrupt(digitalPinToInterrupt(ANEMOMETER_PIN), handleChangeInterrupt, CHANGE);
     Serial.println("Setup complete. Transmitting wind data.");
     ArduinoOTA.setHostname("JoeyWindTransmitter");
     ArduinoOTA.begin();
+  terminal.println("***WIND SERVER STARTED***");
+  terminal.print("Connected to ");
+  terminal.println(ssid);
+  terminal.print("IP address: ");
+  terminal.println(WiFi.localIP());
+  printLocalTime();
+  terminal.print("Compiled on: ");
+  terminal.print(__DATE__);
+  terminal.print(" at ");
+  terminal.println(__TIME__);
+  terminal.flush();
 }
 
 // ==================== INTERRUPTS ====================
@@ -407,9 +482,10 @@ void IRAM_ATTR handleChangeInterrupt() {
     }
 }
 
+
 // ==================== LOOP ====================
 void loop() {
-    // Turn LED off after 2 ms, or immediately if the switch has already opened
+    // Turn LED off after 10 ms, or immediately if the switch has already opened
     if (ledOnTime && (millis() - ledOnTime >= 2)) {
         digitalWrite(LED_PIN, LOW);
         ledOnTime = 0;
@@ -421,36 +497,50 @@ void loop() {
             Serial.println("WiFi lost — reconnecting...");
             WiFi.disconnect();
             WiFi.reconnect();
-            unsigned long t = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
-                delay(300);
-            }
             reconnectTime = millis();
         }
+    } else if (!mqttClient.connected() && !xTimerIsTimerActive(mqttReconnectTimer)) {
+        // WiFi is up but MQTT is not connected and no reconnect is pending —
+        // this can happen if WiFi dropped before the MQTT disconnect callback
+        // had a chance to arm the timer. Kick off a reconnect now.
+        Serial.println("WiFi up but MQTT disconnected — scheduling reconnect...");
+        xTimerStart(mqttReconnectTimer, 0);
     }
 
     if (WiFi.status() == WL_CONNECTED) {
         Blynk.run();
         ArduinoOTA.handle();
     }
+    if ((WiFi.status() == WL_CONNECTED) && !Blynk.connected()) {
+        Blynk.connect();
+    }
+
 
     // Sample wind speed every second
     every(1000) {
         updateWindData();
     }
 
-    // Sample wind vane every 3 seconds and push to Hubert bridge
+    // Sample wind vane every 3 seconds and publish to MQTT
     every(3000) {
         windVaneReading = readWindVaneADC();
         float angle = getWindDirection(windVaneReading);
-        // FIX: added braces — previously only the dirSamples assignment was
-        // guarded by the if; the three virtualWrite calls always executed.
+
         if (dirSampleCount < DIR_SAMPLE_MAX) {
             dirSamples[dirSampleCount++] = angle;
         }
-        bridgeHubert.virtualWrite(V84, averageWindSpeed);
-        bridgeHubert.virtualWrite(V85, windGust);
-        bridgeHubert.virtualWrite(V86, angle);
+
+        if (mqttClient.connected()) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.2f", averageWindSpeed);
+            mqttClient.publish("home/joeywind/avgwind", 0, false, buf);
+
+            snprintf(buf, sizeof(buf), "%.2f", windGust);
+            mqttClient.publish("home/joeywind/windgust", 0, false, buf);
+
+            snprintf(buf, sizeof(buf), "%.1f", angle);
+            mqttClient.publish("home/joeywind/angle", 0, false, buf);
+        }
     }
 
     // Push to Blynk every 60 seconds using mode direction from accumulated samples
@@ -474,23 +564,43 @@ void loop() {
         // Reset direction sample buffer for next minute
         dirSampleCount = 0;
 
-
+        // Store this minute's mode direction for hourly calculation
+        if (hourlyDirSampleCount < HOURLY_DIR_SAMPLE_MAX) {
+            hourlyDirSamples[hourlyDirSampleCount++] = windAngle;
+        }
 
         if (Blynk.connected()) {
             Blynk.virtualWrite(VPIN_AVG_WIND,  averageWindSpeed);
             Blynk.virtualWrite(VPIN_WIND_GUST, windGust);
             Blynk.virtualWrite(VPIN_WIND_ANGLE, windAngle);
         }
-        // Wind direction goes directly to PostgreSQL (sensorid=38, value1=angle)
-        // to avoid Blynk's improper circular averaging (e.g. 0° and 359° → 180°).
-        // Only send once we have a valid NTP-synced epoch time.
-        if (isNtpSynced) {
-            sendWindDirectionToPg(windAngle);
-        }
-        // FIX: Reset gust so it reflects the peak of the *next* 60-second
+        // FIX: Reset gust so it reflects the peak of the *next* reporting
         // window rather than accumulating indefinitely.
+        // Do NOT reset avgCount/avgIndex — the rolling window is continuous.
         windGust = 0.0;
-        avgCount = 0;
-        avgIndex = 0;
+    }
+
+    // Calculate and push hourly mode direction every 3600 seconds (1 hour)
+    every(3600000) {
+        // Compute mode direction from the 60 minutely mode values
+        if (hourlyDirSampleCount > 0) {
+            int votes[WMK_NUM_ANGLES] = {};
+            for (int i = 0; i < hourlyDirSampleCount; i++) {
+                int idx = (int)roundf(hourlyDirSamples[i] / SFE_WIND_VANE_DEGREES_PER_INDEX)
+                          % WMK_NUM_ANGLES;
+                votes[idx]++;
+            }
+            int bestIdx = 0;
+            for (int i = 1; i < WMK_NUM_ANGLES; i++) {
+                if (votes[i] > votes[bestIdx]) bestIdx = i;
+            }
+            hourlyWindAngle = bestIdx * SFE_WIND_VANE_DEGREES_PER_INDEX;
+        }
+        // Reset hourly direction sample buffer for next hour
+        hourlyDirSampleCount = 0;
+
+        if (Blynk.connected()) {
+            Blynk.virtualWrite(VPIN_WIND_ANGLE_HOURLY, hourlyWindAngle);
+        }
     }
 }
